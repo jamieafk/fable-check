@@ -6,7 +6,7 @@ Give any coding agent (Claude Code, Codex) and any terminal a one-command, exten
 
 ## Target user
 
-Jamie (and builders like him): people who do most development through coding agents and want an independent, high-quality second opinion on changes without leaving their workflow or setting up API keys.
+Builders who do most of their development through coding agents and want an independent, high-quality second opinion on changes without leaving their workflow or setting up API keys.
 
 ## Success criteria
 

@@ -21,6 +21,8 @@ The reviewer runs **read-only**: it can read files, grep, and run read-only git 
 ## Install
 
 ```bash
+git clone https://github.com/jamieafk/fable-check.git
+cd fable-check
 ./install.sh
 ```
 
@@ -59,4 +61,10 @@ Structured output is validated against the schema by the CLI itself. Reports are
 | Task delegation (`rescue`) | yes | not included (out of scope: this is a review tool) |
 | Stop-hook review gate | optional | not included (plugin-only machinery; drains usage) |
 
-Prompt structure, output schema, and review-target selection are adapted from codex-plugin-cc (Apache-2.0) — see `NOTICE`.
+## License & attribution
+
+Apache-2.0 — see `LICENSE`.
+
+This project is **inspired by, and adapts portions of,** [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (Apache-2.0): the review/adversarial prompt structure, the structured findings schema, and the review-target selection design. See `NOTICE` for details. All other code is original.
+
+fable-check is an independent project, **not affiliated with or endorsed by OpenAI or Anthropic**. "Claude" and "Codex" refer to the third-party tools it integrates with.
