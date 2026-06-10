@@ -1,0 +1,1154 @@
+#!/usr/bin/env node
+// fable-check — extensive code review powered by Claude Fable 5.
+// Runs the local `claude` CLI headlessly with read-only tools; auth rides on the
+// user's existing Claude Code login. Portions of the prompt/schema design are
+// adapted from openai/codex-plugin-cc (Apache-2.0) — see NOTICE.
+
+import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const SKILL_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const SCHEMA_PATH = path.join(SKILL_ROOT, "schemas", "review-output.schema.json");
+const STATE_ROOT = path.join(os.homedir(), ".fable-check", "jobs");
+
+const DEFAULT_MODEL = "claude-fable-5";
+const DEFAULT_EFFORT = "xhigh";
+const MERGE_EFFORT = "high";
+const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const MAX_INLINE_DIFF_BYTES = 400 * 1024;
+const MAX_UNTRACKED_FILE_BYTES = 48 * 1024;
+const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
+
+// Read-only surface for the headless reviewer. Anything not listed is denied.
+const ALLOWED_TOOLS = [
+  "Read",
+  "Grep",
+  "Glob",
+  "Bash(git diff:*)",
+  "Bash(git log:*)",
+  "Bash(git show:*)",
+  "Bash(git status)",
+  "Bash(git status:*)",
+  "Bash(git ls-files:*)",
+  "Bash(git blame:*)",
+  "Bash(git rev-parse:*)",
+  "Bash(git merge-base:*)",
+  "Bash(git branch:*)",
+].join(",");
+const DISALLOWED_TOOLS = [
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "Task",
+  "Agent",
+  "WebSearch",
+  "WebFetch",
+  "KillShell",
+].join(",");
+
+const LENSES = [
+  {
+    key: "correctness",
+    label: "Correctness",
+    emphasis:
+      "logic errors, wrong conditions, off-by-one and boundary mistakes, broken control flow, incorrect API usage, type mismatches, results that differ from the stated intent of the change",
+  },
+  {
+    key: "security",
+    label: "Security & data safety",
+    emphasis:
+      "injection, auth/permission gaps, secrets exposure, unsafe deserialization or file handling, data loss or corruption, irreversible state changes, missing validation at trust boundaries",
+  },
+  {
+    key: "resilience",
+    label: "Design & failure modes",
+    emphasis:
+      "unhandled errors, empty/null/timeout paths, race conditions and re-entrancy, retry and idempotency gaps, schema/config drift, stale references left behind by renames or deletions, compatibility regressions",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// small utilities
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function shorten(text, limit = 96) {
+  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+// Hosts sometimes pass every argument as one quoted string; split it shell-style.
+function splitRawArgumentString(raw) {
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+
+function normalizeArgv(argv) {
+  if (argv.length === 1 && /\s/.test(argv[0] ?? "")) {
+    return splitRawArgumentString(argv[0]);
+  }
+  return argv;
+}
+
+function parseArgs(argv, { valueFlags = [], boolFlags = [] } = {}) {
+  const options = {};
+  const positionals = [];
+  const values = new Set(valueFlags);
+  const bools = new Set(boolFlags);
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      const name = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
+      if (bools.has(name)) {
+        options[name] = true;
+      } else if (values.has(name)) {
+        if (eq !== -1) {
+          options[name] = arg.slice(eq + 1);
+        } else {
+          options[name] = argv[++i];
+          if (options[name] === undefined) fail(`Missing value for --${name}.`);
+        }
+      } else {
+        fail(`Unknown flag --${name}. Run \`fable-check.mjs help\` for usage.`);
+      }
+    } else {
+      positionals.push(arg);
+    }
+  }
+  return { options, positionals };
+}
+
+// ---------------------------------------------------------------------------
+// git helpers
+
+function git(cwd, args, opts = {}) {
+  return spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    ...opts,
+  });
+}
+
+function gitChecked(cwd, args) {
+  const result = git(cwd, args);
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${String(result.stderr).trim()}`);
+  }
+  return result.stdout;
+}
+
+function ensureGitRepository(cwd) {
+  const result = git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (result.error && result.error.code === "ENOENT") {
+    throw new Error("git is not installed. Install Git and retry.");
+  }
+  if (result.status !== 0) {
+    throw new Error("fable-check must run inside a Git repository.");
+  }
+  return result.stdout.trim();
+}
+
+function getCurrentBranch(cwd) {
+  return gitChecked(cwd, ["branch", "--show-current"]).trim() || "HEAD";
+}
+
+function detectDefaultBranch(cwd) {
+  const symbolic = git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
+  if (symbolic.status === 0) {
+    const head = symbolic.stdout.trim();
+    if (head.startsWith("refs/remotes/origin/")) {
+      return head.replace("refs/remotes/origin/", "");
+    }
+  }
+  for (const candidate of ["main", "master", "trunk"]) {
+    if (git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`]).status === 0) {
+      return candidate;
+    }
+    if (
+      git(cwd, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`]).status === 0
+    ) {
+      return `origin/${candidate}`;
+    }
+  }
+  throw new Error(
+    "Unable to detect the default branch. Pass --base <ref> or use --scope working-tree."
+  );
+}
+
+function getWorkingTreeState(cwd) {
+  const lines = (out) => out.trim().split("\n").filter(Boolean);
+  const staged = lines(gitChecked(cwd, ["diff", "--cached", "--name-only"]));
+  const unstaged = lines(gitChecked(cwd, ["diff", "--name-only"]));
+  const untracked = lines(gitChecked(cwd, ["ls-files", "--others", "--exclude-standard"]));
+  return {
+    staged,
+    unstaged,
+    untracked,
+    isDirty: staged.length > 0 || unstaged.length > 0 || untracked.length > 0,
+  };
+}
+
+function resolveReviewTarget(cwd, { base = null, scope = "auto" } = {}) {
+  ensureGitRepository(cwd);
+  if (base) {
+    return { mode: "branch", label: `branch diff against ${base}`, baseRef: base };
+  }
+  if (scope === "working-tree") {
+    return { mode: "working-tree", label: "working tree diff" };
+  }
+  if (scope === "branch") {
+    const detected = detectDefaultBranch(cwd);
+    return { mode: "branch", label: `branch diff against ${detected}`, baseRef: detected };
+  }
+  if (scope !== "auto") {
+    throw new Error(`Unsupported --scope "${scope}". Use auto, working-tree, or branch.`);
+  }
+  if (getWorkingTreeState(cwd).isDirty) {
+    return { mode: "working-tree", label: "working tree diff" };
+  }
+  const detected = detectDefaultBranch(cwd);
+  return { mode: "branch", label: `branch diff against ${detected}`, baseRef: detected };
+}
+
+function formatSection(title, body) {
+  return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
+}
+
+function looksBinary(buffer) {
+  const probe = buffer.subarray(0, 8000);
+  return probe.includes(0);
+}
+
+function formatUntrackedFile(repoRoot, relativePath) {
+  const absolute = path.join(repoRoot, relativePath);
+  let stat;
+  try {
+    stat = fs.statSync(absolute);
+  } catch {
+    return `### ${relativePath}\n(skipped: unreadable)`;
+  }
+  if (stat.isDirectory()) return `### ${relativePath}\n(skipped: directory)`;
+  if (stat.size > MAX_UNTRACKED_FILE_BYTES) {
+    return `### ${relativePath}\n(skipped: ${stat.size} bytes — read it with the Read tool if relevant)`;
+  }
+  let buffer;
+  try {
+    buffer = fs.readFileSync(absolute);
+  } catch {
+    return `### ${relativePath}\n(skipped: unreadable)`;
+  }
+  if (looksBinary(buffer)) return `### ${relativePath}\n(skipped: binary file)`;
+  return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
+}
+
+function collectReviewContext(cwd, target) {
+  const repoRoot = ensureGitRepository(cwd);
+  const branch = getCurrentBranch(repoRoot);
+
+  if (target.mode === "working-tree") {
+    const state = getWorkingTreeState(repoRoot);
+    const status = gitChecked(repoRoot, ["status", "--short", "--untracked-files=all"]);
+    const stagedDiff = gitChecked(repoRoot, ["diff", "--cached", "--no-ext-diff"]);
+    const unstagedDiff = gitChecked(repoRoot, ["diff", "--no-ext-diff"]);
+    const diffBytes = Buffer.byteLength(stagedDiff) + Buffer.byteLength(unstagedDiff);
+    const inline = diffBytes <= MAX_INLINE_DIFF_BYTES;
+    const untrackedBody = state.untracked
+      .map((f) => formatUntrackedFile(repoRoot, f))
+      .join("\n\n");
+
+    const parts = [formatSection("Git Status", status)];
+    if (inline) {
+      parts.push(formatSection("Staged Diff", stagedDiff));
+      parts.push(formatSection("Unstaged Diff", unstagedDiff));
+      parts.push(formatSection("Untracked Files", untrackedBody));
+    } else {
+      parts.push(
+        formatSection("Staged Diff Stat", gitChecked(repoRoot, ["diff", "--shortstat", "--cached"]))
+      );
+      parts.push(formatSection("Unstaged Diff Stat", gitChecked(repoRoot, ["diff", "--shortstat"])));
+      parts.push(formatSection("Untracked Files", state.untracked.join("\n")));
+    }
+
+    const fileCount =
+      new Set([...state.staged, ...state.unstaged, ...state.untracked]).size;
+    return {
+      repoRoot,
+      branch,
+      target,
+      fileCount,
+      inline,
+      collectionGuidance: inline
+        ? "Use the repository context below as primary evidence; read surrounding files with your tools where the diff alone is not enough."
+        : "The repository context below is a summary only — the diff was too large to inline. Collect it yourself with `git diff --cached` and `git diff` (and Read for untracked files) before forming any conclusion.",
+      content: parts.join("\n"),
+      summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s) on ${branch}.`,
+    };
+  }
+
+  const mergeBase = gitChecked(repoRoot, ["merge-base", "HEAD", target.baseRef]).trim();
+  const range = `${mergeBase}..HEAD`;
+  const logOutput = gitChecked(repoRoot, ["log", "--oneline", "--decorate", range]);
+  const diffStat = gitChecked(repoRoot, ["diff", "--stat", range]);
+  const changedFiles = gitChecked(repoRoot, ["diff", "--name-only", range])
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+  const branchDiff = gitChecked(repoRoot, ["diff", "--no-ext-diff", range]);
+  const inline = Buffer.byteLength(branchDiff) <= MAX_INLINE_DIFF_BYTES;
+
+  const parts = [formatSection("Commit Log", logOutput), formatSection("Diff Stat", diffStat)];
+  if (inline) {
+    parts.push(formatSection("Branch Diff", branchDiff));
+  } else {
+    parts.push(formatSection("Changed Files", changedFiles.join("\n")));
+  }
+
+  return {
+    repoRoot,
+    branch,
+    target,
+    fileCount: changedFiles.length,
+    inline,
+    collectionGuidance: inline
+      ? "Use the repository context below as primary evidence; read surrounding files with your tools where the diff alone is not enough."
+      : `The repository context below is a summary only — the diff was too large to inline. Collect it yourself with \`git diff ${mergeBase}..HEAD\` (per-file if needed) before forming any conclusion.`,
+    content: parts.join("\n"),
+    summary: `Reviewing branch ${branch} against ${target.baseRef} from merge-base ${mergeBase.slice(0, 12)}.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// prompt assembly
+
+function loadPrompt(name) {
+  return fs.readFileSync(path.join(SKILL_ROOT, "prompts", `${name}.md`), "utf8");
+}
+
+function interpolate(template, variables) {
+  return template.replace(/\{\{([A-Z_]+)\}\}/g, (_, key) =>
+    Object.prototype.hasOwnProperty.call(variables, key) ? variables[key] : ""
+  );
+}
+
+function buildLensBlock(lens) {
+  if (!lens) return "";
+  return [
+    "",
+    "<lens>",
+    `This pass is one of several independent passes over the same change; each concentrates on a different failure class.`,
+    `Your lens: ${lens.label} — concentrate exclusively on ${lens.emphasis}.`,
+    "Report only findings inside this lens; other passes cover the rest.",
+    "</lens>",
+    "",
+  ].join("\n");
+}
+
+function buildReviewPrompt({ adversarial, context, focusText, lens }) {
+  const template = loadPrompt(adversarial ? "adversarial-review" : "review");
+  return interpolate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content,
+    LENS_BLOCK: buildLensBlock(lens),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// headless claude invocation
+
+function runClaude({ prompt, cwd, model, effort, log }) {
+  const schema = fs.readFileSync(SCHEMA_PATH, "utf8");
+  // Agentic -p runs don't reliably enforce --json-schema, so the schema also
+  // goes into the prompt verbatim — exact field names, exact enums.
+  const fullPrompt = `${prompt}\n\n<output_schema>\nYour final message must be exactly one JSON object conforming to this JSON Schema — no markdown fences, no prose before or after, no extra or renamed fields:\n${schema}\n</output_schema>\n`;
+  const args = [
+    "-p",
+    "--model",
+    model,
+    "--effort",
+    effort,
+    "--output-format",
+    "json",
+    "--json-schema",
+    schema,
+    "--allowedTools",
+    ALLOWED_TOOLS,
+    "--disallowedTools",
+    DISALLOWED_TOOLS,
+    "--permission-mode",
+    "default",
+  ];
+
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const child = spawn("claude", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, CLAUDE_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ status: 1, stdout, stderr: `${stderr}\n${error.message}`, durationMs: Date.now() - started, timedOut });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ status: code ?? 1, stdout, stderr, durationMs: Date.now() - started, timedOut });
+    });
+
+    child.stdin.write(fullPrompt);
+    child.stdin.end();
+    log?.(`claude started (model=${model}, effort=${effort}, pid=${child.pid})`);
+  }).then((result) => {
+    let envelope = null;
+    try {
+      envelope = JSON.parse(result.stdout);
+    } catch {
+      // leave null; caller handles
+    }
+    return { ...result, envelope };
+  });
+}
+
+function extractStructured(envelope) {
+  if (!envelope) return null;
+  if (envelope.structured_output && typeof envelope.structured_output === "object") {
+    return envelope.structured_output;
+  }
+  const text = typeof envelope.result === "string" ? envelope.result : "";
+  const candidates = [text];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) candidates.unshift(fenced[1]);
+  const brace = text.match(/\{[\s\S]*\}/);
+  if (brace) candidates.push(brace[0]);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// report rendering
+
+const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 };
+const SEVERITY_ALIASES = {
+  blocker: "critical",
+  critical: "critical",
+  major: "high",
+  high: "high",
+  moderate: "medium",
+  medium: "medium",
+  minor: "low",
+  low: "low",
+  info: "low",
+};
+const VALID_CATEGORIES = new Set([
+  "correctness",
+  "security",
+  "data-safety",
+  "concurrency",
+  "error-handling",
+  "performance",
+  "design",
+  "compatibility",
+  "other",
+]);
+
+// The CLI schema-validates when it can, but agentic runs sometimes fall back to
+// loose JSON in `result` — normalize so the report never shows raw model output.
+function normalizeReviewData(data) {
+  const findings = Array.isArray(data.findings) ? data.findings : [];
+  const normalized = findings.map((raw, index) => {
+    const f = raw && typeof raw === "object" ? raw : {};
+    const severity =
+      SEVERITY_ALIASES[String(f.severity ?? "").toLowerCase().trim()] ?? "low";
+    const category = VALID_CATEGORIES.has(String(f.category ?? "").toLowerCase().trim())
+      ? String(f.category).toLowerCase().trim()
+      : "other";
+    let lineStart = Number.isInteger(f.line_start) && f.line_start > 0 ? f.line_start : null;
+    let lineEnd =
+      Number.isInteger(f.line_end) && f.line_end >= (lineStart ?? 1) ? f.line_end : lineStart;
+    if (!lineStart) {
+      const range = String(f.lines ?? f.line ?? "").match(/(\d+)(?:\s*[-–]\s*(\d+))?/);
+      if (range) {
+        lineStart = Number(range[1]);
+        lineEnd = range[2] ? Number(range[2]) : lineStart;
+      }
+    }
+    const confidence =
+      typeof f.confidence === "number" ? Math.min(1, Math.max(0, f.confidence)) : 0.5;
+    return {
+      severity,
+      category,
+      title: String(f.title ?? `Finding ${index + 1}`).trim() || `Finding ${index + 1}`,
+      body: String(f.body ?? f.details ?? f.description ?? "No details provided.").trim(),
+      file: String(f.file ?? f.path ?? "unknown").trim() || "unknown",
+      line_start: lineStart,
+      line_end: lineEnd,
+      confidence,
+      recommendation: String(f.recommendation ?? f.fix ?? f.suggestion ?? "").trim(),
+    };
+  });
+  const verdictText = String(data.verdict ?? data.status ?? data.assessment ?? "")
+    .toLowerCase()
+    .trim();
+  return {
+    verdict: ["approve", "approved", "ship", "pass"].includes(verdictText)
+      ? "approve"
+      : "needs-attention",
+    summary: String(data.summary ?? "").trim() || "No summary provided.",
+    findings: normalized,
+    next_steps: (Array.isArray(data.next_steps) ? data.next_steps : [])
+      .map((s) => String(s).trim())
+      .filter(Boolean),
+  };
+}
+
+function formatLineRange(finding) {
+  if (!finding.line_start) return "";
+  if (!finding.line_end || finding.line_end === finding.line_start) return `:${finding.line_start}`;
+  return `:${finding.line_start}-${finding.line_end}`;
+}
+
+function renderReport(data, meta) {
+  const lines = [
+    `# Fable ${meta.reviewLabel}`,
+    "",
+    `Target: ${meta.targetLabel}`,
+    `Verdict: ${data.verdict}`,
+    "",
+    data.summary,
+    "",
+  ];
+
+  const findings = [...(data.findings ?? [])].sort(
+    (a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
+  );
+
+  if (findings.length === 0) {
+    lines.push("No material findings.");
+  } else {
+    lines.push("Findings:");
+    for (const finding of findings) {
+      const confidence = Math.round((finding.confidence ?? 0) * 100);
+      lines.push(
+        `- [${finding.severity}/${finding.category ?? "other"}] ${finding.title} (${finding.file}${formatLineRange(finding)}, confidence ${confidence}%)`
+      );
+      lines.push(`  ${finding.body}`);
+      if (finding.recommendation) lines.push(`  Recommendation: ${finding.recommendation}`);
+    }
+  }
+
+  if ((data.next_steps ?? []).length > 0) {
+    lines.push("", "Next steps:");
+    for (const step of data.next_steps) lines.push(`- ${step}`);
+  }
+
+  if (meta.sessionIds?.length) {
+    lines.push("", `Resume interactively: claude -r ${meta.sessionIds[meta.sessionIds.length - 1]}`);
+  }
+  if (meta.costUsd != null) {
+    lines.push(`Estimated cost: $${meta.costUsd.toFixed(2)}`);
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function renderFailure(meta, detail, rawText) {
+  const lines = [
+    `# Fable ${meta.reviewLabel}`,
+    "",
+    `Target: ${meta.targetLabel}`,
+    "The reviewer did not return a valid structured result.",
+    "",
+    `- Detail: ${detail}`,
+  ];
+  if (rawText) lines.push("", "Raw output:", "", "```text", shorten(rawText, 4000), "```");
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// job state
+
+function repoSlug(repoRoot) {
+  const hash = crypto.createHash("sha1").update(repoRoot).digest("hex").slice(0, 8);
+  return `${path.basename(repoRoot)}-${hash}`;
+}
+
+function jobsDir(repoRoot) {
+  const dir = path.join(STATE_ROOT, repoSlug(repoRoot));
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function newJobId() {
+  return `rev-${crypto.randomBytes(4).toString("hex")}`;
+}
+
+function jobFilePath(dir, id) {
+  return path.join(dir, `${id}.json`);
+}
+
+function writeJob(dir, job) {
+  fs.writeFileSync(jobFilePath(dir, job.id), JSON.stringify(job, null, 2));
+}
+
+function readJob(dir, id) {
+  try {
+    return JSON.parse(fs.readFileSync(jobFilePath(dir, id), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function listJobs(dir) {
+  let entries = [];
+  try {
+    entries = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith(".json") && !f.endsWith(".data.json"));
+  } catch {
+    return [];
+  }
+  const jobs = entries
+    .map((f) => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  return jobs.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+function appendLog(logFile, line) {
+  try {
+    fs.appendFileSync(logFile, `[${nowIso()}] ${line}\n`);
+  } catch {
+    // logging must never break the run
+  }
+}
+
+function isAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Reconcile stale state: a job marked running whose process died.
+function effectiveStatus(job) {
+  if (job.status === "running" && !isAlive(job.pid)) return "failed (worker died)";
+  return job.status;
+}
+
+// ---------------------------------------------------------------------------
+// the review pipeline
+
+async function executeReview(request, { dir, job, log }) {
+  const cwd = request.cwd;
+  const target = resolveReviewTarget(cwd, { base: request.base, scope: request.scope });
+  const context = collectReviewContext(cwd, target);
+  log(`target: ${target.label}`);
+  log(context.summary);
+  log(`diff ${context.inline ? "inlined" : "too large — reviewer will self-collect"}`);
+
+  const reviewLabel = request.deep
+    ? "Deep Review"
+    : request.adversarial
+      ? "Adversarial Review"
+      : "Review";
+  const meta = { reviewLabel, targetLabel: target.label, sessionIds: [], costUsd: 0 };
+
+  const runPass = async (lens) => {
+    const prompt = buildReviewPrompt({
+      adversarial: request.adversarial,
+      context,
+      focusText: request.focusText,
+      lens,
+    });
+    const result = await runClaude({
+      prompt,
+      cwd: context.repoRoot,
+      model: request.model,
+      effort: request.effort,
+      log,
+    });
+    if (result.envelope?.session_id) meta.sessionIds.push(result.envelope.session_id);
+    if (typeof result.envelope?.total_cost_usd === "number") {
+      meta.costUsd += result.envelope.total_cost_usd;
+    }
+    log(
+      `pass${lens ? ` [${lens.key}]` : ""} finished in ${Math.round(result.durationMs / 1000)}s (exit ${result.status}${result.timedOut ? ", timed out" : ""})`
+    );
+    return result;
+  };
+
+  let finalResult;
+  if (request.deep) {
+    const passes = await Promise.all(LENSES.map((lens) => runPass(lens)));
+    const passPayloads = passes.map((p, i) => ({
+      lens: LENSES[i].key,
+      ok: p.status === 0,
+      result: extractStructured(p.envelope),
+      error: p.status === 0 ? null : shorten(p.stderr || "claude exited non-zero", 400),
+    }));
+    const usable = passPayloads.filter((p) => p.result);
+    if (usable.length === 0) {
+      const detail = passPayloads.map((p) => `${p.lens}: ${p.error ?? "no structured output"}`).join("; ");
+      return { ok: false, rendered: renderFailure(meta, detail, passes[0]?.envelope?.result), meta };
+    }
+    log(`merging ${usable.length}/${LENSES.length} lens passes`);
+    const mergePrompt = interpolate(loadPrompt("merge"), {
+      PASS_COUNT: String(usable.length),
+      TARGET_LABEL: target.label,
+      PASS_RESULTS: usable
+        .map((p) => `### Lens: ${p.lens}\n\`\`\`json\n${JSON.stringify(p.result, null, 2)}\n\`\`\``)
+        .join("\n\n"),
+      REVIEW_INPUT: context.content,
+    });
+    finalResult = await runClaude({
+      prompt: mergePrompt,
+      cwd: context.repoRoot,
+      model: request.model,
+      effort: MERGE_EFFORT,
+      log,
+    });
+    if (finalResult.envelope?.session_id) meta.sessionIds.push(finalResult.envelope.session_id);
+    if (typeof finalResult.envelope?.total_cost_usd === "number") {
+      meta.costUsd += finalResult.envelope.total_cost_usd;
+    }
+  } else {
+    finalResult = await runPass(null);
+  }
+
+  const raw = extractStructured(finalResult.envelope);
+  const looksLikeReview =
+    raw &&
+    (typeof raw.verdict === "string" ||
+      typeof raw.status === "string" ||
+      Array.isArray(raw.findings));
+  const data = looksLikeReview ? normalizeReviewData(raw) : null;
+  if (!data) {
+    const detail = finalResult.timedOut
+      ? "review timed out"
+      : finalResult.status !== 0
+        ? shorten(finalResult.stderr || "claude exited non-zero", 600)
+        : "output did not match the review schema";
+    return {
+      ok: false,
+      rendered: renderFailure(meta, detail, finalResult.envelope?.result ?? finalResult.stdout),
+      meta,
+      data: null,
+    };
+  }
+
+  return { ok: true, rendered: renderReport(data, meta), meta, data };
+}
+
+async function runReviewJob(dir, job) {
+  const log = (line) => appendLog(job.logFile, line);
+  job.status = "running";
+  job.pid = process.pid;
+  writeJob(dir, job);
+  try {
+    const outcome = await executeReview(job.request, { dir, job, log });
+    fs.writeFileSync(job.reportFile, outcome.rendered);
+    if (outcome.data) {
+      fs.writeFileSync(
+        path.join(dir, `${job.id}.data.json`),
+        JSON.stringify(outcome.data, null, 2)
+      );
+    }
+    job.status = outcome.ok ? "completed" : "failed";
+    job.verdict = outcome.data?.verdict ?? null;
+    job.summary = outcome.data?.summary ? shorten(outcome.data.summary, 140) : null;
+    job.sessionIds = outcome.meta.sessionIds;
+    job.costUsd = outcome.meta.costUsd || null;
+    job.completedAt = nowIso();
+    job.pid = null;
+    writeJob(dir, job);
+    return outcome;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`error: ${message}`);
+    fs.writeFileSync(job.reportFile, `# Fable Review\n\nReview failed: ${message}\n`);
+    job.status = "failed";
+    job.error = message;
+    job.completedAt = nowIso();
+    job.pid = null;
+    writeJob(dir, job);
+    return { ok: false, rendered: `Review failed: ${message}\n` };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// subcommands
+
+function buildReviewRequest(options, positionals) {
+  const effort = (options.effort ?? DEFAULT_EFFORT).toLowerCase();
+  if (!VALID_EFFORTS.has(effort)) {
+    fail(`Unsupported effort "${options.effort}". Use one of: low, medium, high, xhigh, max.`);
+  }
+  return {
+    cwd: options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd(),
+    base: options.base ?? null,
+    scope: options.scope ?? "auto",
+    model: options.model ?? DEFAULT_MODEL,
+    effort,
+    adversarial: Boolean(options.adversarial),
+    deep: Boolean(options.deep),
+    focusText: positionals.join(" ").trim(),
+  };
+}
+
+function createJob(dir, request, target) {
+  const id = newJobId();
+  const kindLabel = request.deep ? "deep-review" : request.adversarial ? "adversarial-review" : "review";
+  const job = {
+    id,
+    kind: kindLabel,
+    status: "queued",
+    title: `Fable ${kindLabel}`,
+    targetLabel: target.label,
+    createdAt: nowIso(),
+    completedAt: null,
+    pid: null,
+    reportFile: path.join(dir, `${id}.md`),
+    logFile: path.join(dir, `${id}.log`),
+    request,
+  };
+  writeJob(dir, job);
+  return job;
+}
+
+async function handleReview(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    valueFlags: ["base", "scope", "model", "effort", "cwd"],
+    boolFlags: ["adversarial", "deep", "background", "json"],
+  });
+  const request = buildReviewRequest(options, positionals);
+
+  ensureClaudeAvailable();
+  const repoRoot = ensureGitRepository(request.cwd);
+  const target = resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
+  const dir = jobsDir(repoRoot);
+  const job = createJob(dir, request, target);
+
+  if (options.background) {
+    const scriptPath = fileURLToPath(import.meta.url);
+    const child = spawn(process.execPath, [scriptPath, "worker", "--repo", repoRoot, "--job", job.id], {
+      cwd: repoRoot,
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    job.pid = child.pid ?? null;
+    writeJob(dir, job);
+    const payload = { jobId: job.id, status: "queued", title: job.title, target: target.label };
+    process.stdout.write(
+      options.json
+        ? `${JSON.stringify(payload, null, 2)}\n`
+        : `${job.title} started in the background as ${job.id} (${target.label}).\nCheck progress: fable-check status ${job.id}\nGet the report: fable-check result ${job.id}\n`
+    );
+    return;
+  }
+
+  const outcome = await runReviewJob(dir, job);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({ job: readJob(dir, job.id), result: outcome.data ?? null }, null, 2)}\n`);
+  } else {
+    process.stdout.write(outcome.rendered);
+    process.stdout.write(`\nReport saved: ${job.reportFile}\n`);
+  }
+  if (!outcome.ok) process.exitCode = 1;
+}
+
+async function handleWorker(argv) {
+  const { options } = parseArgs(argv, { valueFlags: ["repo", "job"] });
+  if (!options.repo || !options.job) fail("worker requires --repo and --job.");
+  const dir = jobsDir(options.repo);
+  const job = readJob(dir, options.job);
+  if (!job) fail(`No job ${options.job} found for this repository.`);
+  await runReviewJob(dir, job);
+}
+
+function describeJob(job) {
+  const lines = [`- ${job.id} | ${effectiveStatus(job)} | ${job.kind} | ${job.targetLabel}`];
+  if (job.summary) lines.push(`  Summary: ${job.summary}`);
+  if (job.verdict) lines.push(`  Verdict: ${job.verdict}`);
+  if (job.status === "completed" || job.status === "failed") {
+    lines.push(`  Report: fable-check result ${job.id}`);
+  }
+  if (job.status === "running" || job.status === "queued") {
+    lines.push(`  Cancel: fable-check cancel ${job.id}`);
+    lines.push(`  Log: ${job.logFile}`);
+  }
+  return lines.join("\n");
+}
+
+function handleStatus(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    valueFlags: ["cwd"],
+    boolFlags: ["json"],
+  });
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const repoRoot = ensureGitRepository(cwd);
+  const dir = jobsDir(repoRoot);
+
+  if (positionals[0]) {
+    const job = readJob(dir, positionals[0]);
+    if (!job) fail(`No job ${positionals[0]} found for this repository.`);
+    process.stdout.write(
+      options.json ? `${JSON.stringify(job, null, 2)}\n` : `# Fable Job Status\n\n${describeJob(job)}\n`
+    );
+    return;
+  }
+
+  const jobs = listJobs(dir);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(jobs, null, 2)}\n`);
+    return;
+  }
+  if (jobs.length === 0) {
+    process.stdout.write("No fable-check jobs recorded for this repository yet.\n");
+    return;
+  }
+  const active = jobs.filter((j) => j.status === "running" || j.status === "queued");
+  const recent = jobs.filter((j) => !(j.status === "running" || j.status === "queued")).slice(0, 5);
+  const lines = ["# Fable Status", ""];
+  if (active.length) {
+    lines.push("Active:");
+    for (const job of active) lines.push(describeJob(job));
+    lines.push("");
+  }
+  if (recent.length) {
+    lines.push("Recent:");
+    for (const job of recent) lines.push(describeJob(job));
+  }
+  process.stdout.write(`${lines.join("\n").trimEnd()}\n`);
+}
+
+function handleResult(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    valueFlags: ["cwd"],
+    boolFlags: ["json"],
+  });
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const repoRoot = ensureGitRepository(cwd);
+  const dir = jobsDir(repoRoot);
+
+  let job;
+  if (positionals[0]) {
+    job = readJob(dir, positionals[0]);
+    if (!job) fail(`No job ${positionals[0]} found for this repository.`);
+  } else {
+    job = listJobs(dir).find((j) => j.status === "completed" || j.status === "failed");
+    if (!job) fail("No finished fable-check job found for this repository.");
+  }
+
+  if (job.status === "running" || job.status === "queued") {
+    fail(`Job ${job.id} is still ${job.status}. Check \`fable-check status ${job.id}\`.`);
+  }
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(job, null, 2)}\n`);
+    return;
+  }
+  let report = "";
+  try {
+    report = fs.readFileSync(job.reportFile, "utf8");
+  } catch {
+    report = `No stored report for ${job.id}.\n`;
+  }
+  process.stdout.write(report.endsWith("\n") ? report : `${report}\n`);
+}
+
+function handleCancel(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    valueFlags: ["cwd"],
+    boolFlags: ["json"],
+  });
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const repoRoot = ensureGitRepository(cwd);
+  const dir = jobsDir(repoRoot);
+
+  let job;
+  if (positionals[0]) {
+    job = readJob(dir, positionals[0]);
+  } else {
+    job = listJobs(dir).find((j) => j.status === "running" || j.status === "queued");
+  }
+  if (!job) fail("No active fable-check job to cancel.");
+  if (job.status !== "running" && job.status !== "queued") {
+    fail(`Job ${job.id} is already ${job.status}.`);
+  }
+
+  if (job.pid && isAlive(job.pid)) {
+    try {
+      process.kill(job.pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+  job.status = "cancelled";
+  job.completedAt = nowIso();
+  job.pid = null;
+  writeJob(dir, job);
+  appendLog(job.logFile, "Cancelled by user.");
+  process.stdout.write(
+    options.json ? `${JSON.stringify(job, null, 2)}\n` : `Cancelled ${job.id} (${job.kind}).\n`
+  );
+}
+
+function ensureClaudeAvailable() {
+  const result = spawnSync("claude", ["--version"], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      "The `claude` CLI is not installed or not on PATH. Install Claude Code (https://claude.com/claude-code), then run `fable-check setup`."
+    );
+  }
+  return result.stdout.trim();
+}
+
+function handleSetup(argv) {
+  const { options } = parseArgs(argv, { boolFlags: ["json"] });
+  const checks = [];
+  const nextSteps = [];
+
+  checks.push({ name: "node", ok: true, detail: process.version });
+
+  let claudeOk = false;
+  let claudeDetail = "";
+  try {
+    claudeDetail = ensureClaudeAvailable();
+    claudeOk = true;
+  } catch (error) {
+    claudeDetail = error.message;
+    nextSteps.push("Install Claude Code: https://claude.com/claude-code");
+  }
+  checks.push({ name: "claude CLI", ok: claudeOk, detail: claudeDetail });
+
+  if (claudeOk) {
+    const auth = spawnSync("claude", ["auth", "status"], { encoding: "utf8" });
+    const authOut = `${auth.stdout ?? ""}${auth.stderr ?? ""}`.trim();
+    const authOk = auth.status === 0;
+    checks.push({ name: "claude auth", ok: authOk, detail: shorten(authOut || "(no output)", 200) });
+    if (!authOk) nextSteps.push("Log in to Claude: run `claude` once and complete login.");
+  }
+
+  const gitResult = spawnSync("git", ["--version"], { encoding: "utf8" });
+  const gitOk = !gitResult.error && gitResult.status === 0;
+  checks.push({ name: "git", ok: gitOk, detail: gitOk ? gitResult.stdout.trim() : "not found" });
+  if (!gitOk) nextSteps.push("Install Git.");
+
+  try {
+    fs.mkdirSync(STATE_ROOT, { recursive: true });
+    checks.push({ name: "state dir", ok: true, detail: STATE_ROOT });
+  } catch (error) {
+    checks.push({ name: "state dir", ok: false, detail: String(error) });
+  }
+
+  const ready = checks.every((c) => c.ok);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({ ready, checks, nextSteps }, null, 2)}\n`);
+    return;
+  }
+  const lines = ["# Fable Check Setup", "", `Status: ${ready ? "ready" : "needs attention"}`, "", "Checks:"];
+  for (const check of checks) lines.push(`- ${check.ok ? "ok" : "MISSING"} ${check.name}: ${check.detail}`);
+  if (nextSteps.length) {
+    lines.push("", "Next steps:");
+    for (const step of nextSteps) lines.push(`- ${step}`);
+  }
+  process.stdout.write(`${lines.join("\n")}\n`);
+  if (!ready) process.exitCode = 1;
+}
+
+function printUsage() {
+  process.stdout.write(
+    [
+      "fable-check — extensive code review powered by Claude Fable 5",
+      "",
+      "Usage:",
+      "  fable-check.mjs setup [--json]",
+      "  fable-check.mjs review [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
+      "                         [--effort low|medium|high|xhigh|max] [--model <model>] [--background] [--json] [focus text]",
+      "  fable-check.mjs status [job-id] [--json]",
+      "  fable-check.mjs result [job-id] [--json]",
+      "  fable-check.mjs cancel [job-id] [--json]",
+      "",
+      "Reviews are read-only. Focus text steers the review (most useful with --adversarial).",
+      "--deep runs three parallel lens passes (correctness, security, design) plus a merge pass.",
+      "",
+    ].join("\n")
+  );
+}
+
+async function main() {
+  const [subcommand, ...rest] = normalizeArgv(process.argv.slice(2));
+  const argv = normalizeArgv(rest);
+  switch (subcommand) {
+    case "setup":
+      handleSetup(argv);
+      break;
+    case "review":
+      await handleReview(argv);
+      break;
+    case "worker":
+      await handleWorker(argv);
+      break;
+    case "status":
+      handleStatus(argv);
+      break;
+    case "result":
+      handleResult(argv);
+      break;
+    case "cancel":
+      handleCancel(argv);
+      break;
+    case undefined:
+    case "help":
+    case "--help":
+      printUsage();
+      break;
+    default:
+      fail(`Unknown subcommand: ${subcommand}. Run \`fable-check.mjs help\` for usage.`);
+  }
+}
+
+main().catch((error) => {
+  fail(error instanceof Error ? error.message : String(error));
+});

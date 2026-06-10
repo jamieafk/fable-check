@@ -1,0 +1,9 @@
+fable-check
+
+The review/adversarial-review prompt structure, the structured review output
+schema, and the git review-target selection design are adapted from the
+"Codex plugin for Claude Code" project (https://github.com/openai/codex-plugin-cc),
+Copyright OpenAI, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+All other code in this project is original.
