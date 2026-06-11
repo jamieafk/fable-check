@@ -23,6 +23,12 @@ const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const MAX_INLINE_DIFF_BYTES = 400 * 1024;
 const MAX_UNTRACKED_FILE_BYTES = 48 * 1024;
 const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
+const HEARTBEAT_MS =
+  Number(process.env.FABLE_CHECK_HEARTBEAT_MS) > 0
+    ? Number(process.env.FABLE_CHECK_HEARTBEAT_MS)
+    : 20 * 1000;
+const JOB_WRITE_THROTTLE_MS = 1500;
+const STALL_WARN_MS = 5 * 60 * 1000;
 
 // Read-only surface for the headless reviewer. Anything not listed is denied.
 const ALLOWED_TOOLS = [
@@ -88,6 +94,14 @@ function shorten(text, limit = 96) {
   const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, limit - 3)}...`;
+}
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) return `${seconds}s`;
+  return `${minutes}m${String(seconds).padStart(2, "0")}s`;
 }
 
 // Hosts sometimes pass every argument as one quoted string; split it shell-style.
@@ -376,11 +390,45 @@ function buildReviewPrompt({ adversarial, context, focusText, lens }) {
 // ---------------------------------------------------------------------------
 // headless claude invocation
 
-function runClaude({ prompt, cwd, model, effort, log }) {
-  const schema = fs.readFileSync(SCHEMA_PATH, "utf8");
-  // Agentic -p runs don't reliably enforce --json-schema, so the schema also
-  // goes into the prompt verbatim — exact field names, exact enums.
-  const fullPrompt = `${prompt}\n\n<output_schema>\nYour final message must be exactly one JSON object conforming to this JSON Schema — no markdown fences, no prose before or after, no extra or renamed fields:\n${schema}\n</output_schema>\n`;
+function summarizeToolUse(name, input, cwd) {
+  const rel = (p) => {
+    const text = String(p ?? "");
+    return cwd && text.startsWith(`${cwd}/`) ? text.slice(cwd.length + 1) : text;
+  };
+  if (name === "Read") return `reading ${rel(input?.file_path)}`;
+  if (name === "Grep") {
+    return `searching for "${shorten(input?.pattern, 40)}"${input?.path ? ` in ${rel(input.path)}` : ""}`;
+  }
+  if (name === "Glob") return `listing files matching ${shorten(input?.pattern, 40)}`;
+  if (name === "Bash") return `running \`${shorten(input?.command, 80)}\``;
+  return `${name} ${shorten(JSON.stringify(input ?? {}), 60)}`;
+}
+
+// Spawned claude processes, tracked so cancellation (signal or cancelled job
+// state) can terminate them instead of orphaning them to burn usage.
+const ACTIVE_CLAUDE_CHILDREN = new Set();
+
+function killActiveClaudeChildren() {
+  for (const child of ACTIVE_CLAUDE_CHILDREN) {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+}
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => {
+    killActiveClaudeChildren();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  });
+}
+
+// Runs the claude CLI with stream-json output so progress is observable while
+// the model works. The final "result" event carries the same envelope fields
+// as --output-format json (result, structured_output, session_id, cost).
+function runClaude({ prompt, cwd, model, effort, withSchema = true, onProgress }) {
   const args = [
     "-p",
     "--model",
@@ -388,9 +436,8 @@ function runClaude({ prompt, cwd, model, effort, log }) {
     "--effort",
     effort,
     "--output-format",
-    "json",
-    "--json-schema",
-    schema,
+    "stream-json",
+    "--verbose",
     "--allowedTools",
     ALLOWED_TOOLS,
     "--disallowedTools",
@@ -398,40 +445,122 @@ function runClaude({ prompt, cwd, model, effort, log }) {
     "--permission-mode",
     "default",
   ];
+  let fullPrompt = prompt;
+  if (withSchema) {
+    const schema = fs.readFileSync(SCHEMA_PATH, "utf8");
+    // Agentic -p runs don't reliably enforce --json-schema, so the schema also
+    // goes into the prompt verbatim — exact field names, exact enums.
+    fullPrompt = `${prompt}\n\n<output_schema>\nYour final message must be exactly one JSON object conforming to this JSON Schema — no markdown fences, no prose before or after, no extra or renamed fields:\n${schema}\n</output_schema>\n`;
+    args.push("--json-schema", schema);
+  }
 
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn("claude", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
+    ACTIVE_CLAUDE_CHILDREN.add(child);
     let stderr = "";
+    let lineBuffer = "";
+    let rawStdout = "";
+    let envelope = null;
     let timedOut = false;
+    let toolCalls = 0;
+    let lastNote = "starting up";
+    let lastEmitAt = Date.now();
+
+    const emit = (text, kind = "info", eventAgeMs = 0) => {
+      lastEmitAt = Date.now();
+      onProgress?.(text, { kind, toolCalls, eventAgeMs });
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
     }, CLAUDE_TIMEOUT_MS);
 
-    child.stdout.on("data", (chunk) => (stdout += chunk));
+    // Long thinking stretches produce no events; the heartbeat keeps callers
+    // (and watching agents) from mistaking that for a stall.
+    let lastEventAtMs = Date.now();
+    const heartbeat = setInterval(() => {
+      if (Date.now() - lastEmitAt < Math.max(0, HEARTBEAT_MS - 2000)) return;
+      const eventAgeMs = Date.now() - lastEventAtMs;
+      const idleNote = eventAgeMs > 60_000 ? ` (no model events for ${formatElapsed(eventAgeMs)})` : "";
+      emit(
+        `still working — ${formatElapsed(Date.now() - started)} elapsed, ${toolCalls} tool call(s) so far, last: ${lastNote}${idleNote}`,
+        "heartbeat",
+        eventAgeMs
+      );
+    }, HEARTBEAT_MS);
+
+    const handleEvent = (event) => {
+      // Any event from the claude process counts as proof of life — including
+      // thinking-token ticks, which are the only events during long reasoning.
+      lastEventAtMs = Date.now();
+      if (event.type === "system" && event.subtype === "thinking_tokens") {
+        if (event.estimated_tokens) lastNote = `thinking (~${event.estimated_tokens} tokens)`;
+        return;
+      }
+      if (event.type === "system" && event.subtype === "init") {
+        emit(`session started (model=${model}, effort=${effort})`);
+        return;
+      }
+      if (event.type === "assistant") {
+        for (const block of event.message?.content ?? []) {
+          if (block.type === "tool_use") {
+            toolCalls += 1;
+            lastNote = summarizeToolUse(block.name, block.input, cwd);
+            emit(`tool #${toolCalls}: ${lastNote}`, "tool");
+          }
+        }
+        return;
+      }
+      if (event.type === "result") {
+        envelope = event;
+      }
+    };
+
+    const consume = (text) => {
+      lineBuffer += text;
+      let newline;
+      while ((newline = lineBuffer.indexOf("\n")) !== -1) {
+        const line = lineBuffer.slice(0, newline).trim();
+        lineBuffer = lineBuffer.slice(newline + 1);
+        if (!line) continue;
+        try {
+          handleEvent(JSON.parse(line));
+        } catch {
+          // non-JSON noise on stdout; ignore
+        }
+      }
+    };
+
+    const finish = (status, extraStderr = "") => {
+      ACTIVE_CLAUDE_CHILDREN.delete(child);
+      clearTimeout(timer);
+      clearInterval(heartbeat);
+      if (lineBuffer.trim()) consume("\n");
+      resolve({
+        status,
+        stdout: rawStdout,
+        stderr: extraStderr ? `${stderr}\n${extraStderr}` : stderr,
+        durationMs: Date.now() - started,
+        timedOut,
+        toolCalls,
+        envelope,
+      });
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      rawStdout += chunk;
+      consume(chunk);
+    });
     child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({ status: 1, stdout, stderr: `${stderr}\n${error.message}`, durationMs: Date.now() - started, timedOut });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ status: code ?? 1, stdout, stderr, durationMs: Date.now() - started, timedOut });
-    });
+    child.on("error", (error) => finish(1, error.message));
+    child.on("close", (code) => finish(code ?? 1));
 
     child.stdin.write(fullPrompt);
     child.stdin.end();
-    log?.(`claude started (model=${model}, effort=${effort}, pid=${child.pid})`);
-  }).then((result) => {
-    let envelope = null;
-    try {
-      envelope = JSON.parse(result.stdout);
-    } catch {
-      // leave null; caller handles
-    }
-    return { ...result, envelope };
+    emit(`claude started (model=${model}, effort=${effort}, pid=${child.pid})`);
   });
 }
 
@@ -619,8 +748,13 @@ function jobFilePath(dir, id) {
   return path.join(dir, `${id}.json`);
 }
 
+// Atomic write: `status` is polled from other processes, and a plain
+// writeFileSync can be read mid-truncation as an empty/torn file.
 function writeJob(dir, job) {
-  fs.writeFileSync(jobFilePath(dir, job.id), JSON.stringify(job, null, 2));
+  const file = jobFilePath(dir, job.id);
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2));
+  fs.renameSync(tmp, file);
 }
 
 function readJob(dir, id) {
@@ -676,16 +810,88 @@ function effectiveStatus(job) {
   return job.status;
 }
 
+// Fans every progress line out to three sinks: the job log file (always), the
+// job JSON's `progress` field (throttled, so `status` shows live state), and
+// stderr when running in the foreground (so the invoking agent or terminal
+// sees continuous activity instead of silence).
+//
+// Persisting also doubles as the cooperative-cancel checkpoint: before each
+// write it re-reads the on-disk job, and if another process marked it
+// cancelled, it kills the claude children and exits instead of overwriting
+// the cancellation.
+function createReporter({ dir, job, interactive }) {
+  let toolCalls = 0;
+  let lastJobWrite = 0;
+  const persist = (force) => {
+    const now = Date.now();
+    if (!force && now - lastJobWrite < JOB_WRITE_THROTTLE_MS) return;
+    lastJobWrite = now;
+    const onDisk = readJob(dir, job.id);
+    if (onDisk?.status === "cancelled") {
+      appendLog(job.logFile, "cancellation detected — stopping claude and exiting");
+      if (interactive && !job.request?.quiet) {
+        process.stderr.write("[fable-check] cancellation detected — stopping\n");
+      }
+      killActiveClaudeChildren();
+      process.exit(1);
+    }
+    try {
+      writeJob(dir, job);
+    } catch {
+      // progress persistence must never break the run
+    }
+  };
+  const reporter = {
+    line(text, { kind = "info", force = false, eventAgeMs = 0 } = {}) {
+      if (kind === "tool") toolCalls += 1;
+      appendLog(job.logFile, text);
+      if (interactive && !job.request?.quiet) {
+        process.stderr.write(`[fable-check] ${text}\n`);
+      }
+      // lastActivityAt is "when did the wrapper last say something" (display);
+      // lastEventAt is "when did the model last show proof of life" (stall
+      // detection). Heartbeats only refresh the latter via eventAgeMs, and it
+      // only moves forward — parallel lens passes must not regress it.
+      const candidateMs = kind === "heartbeat" ? Date.now() - eventAgeMs : Date.now();
+      const existingMs = Date.parse(job.progress?.lastEventAt ?? "") || 0;
+      job.progress = {
+        ...job.progress,
+        toolCalls,
+        lastActivity: shorten(text, 140),
+        lastActivityAt: nowIso(),
+        lastEventAt: new Date(Math.max(candidateMs, existingMs)).toISOString(),
+      };
+      persist(force);
+    },
+    phase(name) {
+      job.progress = { ...job.progress, phase: name };
+      reporter.line(`phase: ${name}`, { force: true });
+    },
+    forClaude(label) {
+      const tag = label ? `[${label}] ` : "";
+      return (text, meta = {}) =>
+        reporter.line(`${tag}${text}`, { kind: meta.kind, eventAgeMs: meta.eventAgeMs ?? 0 });
+    },
+  };
+  return reporter;
+}
+
 // ---------------------------------------------------------------------------
 // the review pipeline
 
-async function executeReview(request, { dir, job, log }) {
+async function executeReview(request, { reporter }) {
   const cwd = request.cwd;
+  reporter.phase("collecting change context");
   const target = resolveReviewTarget(cwd, { base: request.base, scope: request.scope });
   const context = collectReviewContext(cwd, target);
-  log(`target: ${target.label}`);
-  log(context.summary);
-  log(`diff ${context.inline ? "inlined" : "too large — reviewer will self-collect"}`);
+  reporter.line(`target: ${target.label}`);
+  reporter.line(context.summary);
+  reporter.line(`diff ${context.inline ? "inlined" : "too large — reviewer will self-collect"}`);
+  reporter.line(
+    request.deep
+      ? "deep mode: expect roughly 5-15 minutes (3 parallel passes + merge); progress lines stream continuously"
+      : "expect roughly 2-8 minutes depending on change size and effort; progress lines stream continuously"
+  );
 
   const reviewLabel = request.deep
     ? "Deep Review"
@@ -694,7 +900,7 @@ async function executeReview(request, { dir, job, log }) {
       : "Review";
   const meta = { reviewLabel, targetLabel: target.label, sessionIds: [], costUsd: 0 };
 
-  const runPass = async (lens) => {
+  const runPass = async (lens, effortOverride) => {
     const prompt = buildReviewPrompt({
       adversarial: request.adversarial,
       context,
@@ -705,22 +911,33 @@ async function executeReview(request, { dir, job, log }) {
       prompt,
       cwd: context.repoRoot,
       model: request.model,
-      effort: request.effort,
-      log,
+      effort: effortOverride ?? request.effort,
+      onProgress: reporter.forClaude(lens?.key),
     });
     if (result.envelope?.session_id) meta.sessionIds.push(result.envelope.session_id);
     if (typeof result.envelope?.total_cost_usd === "number") {
       meta.costUsd += result.envelope.total_cost_usd;
     }
-    log(
-      `pass${lens ? ` [${lens.key}]` : ""} finished in ${Math.round(result.durationMs / 1000)}s (exit ${result.status}${result.timedOut ? ", timed out" : ""})`
+    reporter.line(
+      `pass${lens ? ` [${lens.key}]` : ""} finished in ${formatElapsed(result.durationMs)} (exit ${result.status}${result.timedOut ? ", timed out" : ""})`,
+      { force: true }
     );
     return result;
   };
 
   let finalResult;
   if (request.deep) {
-    const passes = await Promise.all(LENSES.map((lens) => runPass(lens)));
+    reporter.phase(`running ${LENSES.length} lens passes in parallel (correctness, security, design)`);
+    let lensesDone = 0;
+    const passes = await Promise.all(
+      LENSES.map((lens) =>
+        runPass(lens).then((result) => {
+          lensesDone += 1;
+          reporter.phase(`lens passes: ${lensesDone}/${LENSES.length} complete`);
+          return result;
+        })
+      )
+    );
     const passPayloads = passes.map((p, i) => ({
       lens: LENSES[i].key,
       ok: p.status === 0,
@@ -732,7 +949,7 @@ async function executeReview(request, { dir, job, log }) {
       const detail = passPayloads.map((p) => `${p.lens}: ${p.error ?? "no structured output"}`).join("; ");
       return { ok: false, rendered: renderFailure(meta, detail, passes[0]?.envelope?.result), meta };
     }
-    log(`merging ${usable.length}/${LENSES.length} lens passes`);
+    reporter.phase(`merging ${usable.length}/${LENSES.length} lens passes into one report`);
     const mergePrompt = interpolate(loadPrompt("merge"), {
       PASS_COUNT: String(usable.length),
       TARGET_LABEL: target.label,
@@ -746,15 +963,17 @@ async function executeReview(request, { dir, job, log }) {
       cwd: context.repoRoot,
       model: request.model,
       effort: MERGE_EFFORT,
-      log,
+      onProgress: reporter.forClaude("merge"),
     });
     if (finalResult.envelope?.session_id) meta.sessionIds.push(finalResult.envelope.session_id);
     if (typeof finalResult.envelope?.total_cost_usd === "number") {
       meta.costUsd += finalResult.envelope.total_cost_usd;
     }
   } else {
+    reporter.phase("review pass running (reading code, tracing data flow, verifying findings)");
     finalResult = await runPass(null);
   }
+  reporter.phase("rendering report");
 
   const raw = extractStructured(finalResult.envelope);
   const looksLikeReview =
@@ -780,13 +999,97 @@ async function executeReview(request, { dir, job, log }) {
   return { ok: true, rendered: renderReport(data, meta), meta, data };
 }
 
-async function runReviewJob(dir, job) {
-  const log = (line) => appendLog(job.logFile, line);
+// Advisory mode: same read-only reviewer harness, but the deliverable is a
+// prose answer to a question instead of a structured findings report.
+async function executeAdvisory(request, { reporter }) {
+  const repoRoot = ensureGitRepository(request.cwd);
+  reporter.phase("collecting repository orientation");
+  const branch = getCurrentBranch(repoRoot);
+  const gitStatus = gitChecked(repoRoot, ["status", "--short"]).trim() || "(clean)";
+  let recentCommits = "(no commits yet)";
+  try {
+    recentCommits = gitChecked(repoRoot, ["log", "--oneline", "-15"]).trim() || recentCommits;
+  } catch {
+    // empty repo; keep the placeholder
+  }
+  const prompt = interpolate(loadPrompt("advise"), {
+    QUESTION: request.question,
+    BRANCH: branch,
+    // length-truncate only; shorten() would collapse the line structure
+    GIT_STATUS: gitStatus.length > 4000 ? `${gitStatus.slice(0, 4000)}\n...(truncated)` : gitStatus,
+    RECENT_COMMITS: recentCommits,
+  });
+
+  const meta = { reviewLabel: "Advisory", targetLabel: `question on ${branch}`, sessionIds: [], costUsd: 0 };
+  reporter.phase("advisor exploring the repository and forming an answer");
+  reporter.line("expect roughly 1-6 minutes depending on the question; progress lines stream continuously");
+  const result = await runClaude({
+    prompt,
+    cwd: repoRoot,
+    model: request.model,
+    effort: request.effort,
+    withSchema: false,
+    onProgress: reporter.forClaude(null),
+  });
+  if (result.envelope?.session_id) meta.sessionIds.push(result.envelope.session_id);
+  if (typeof result.envelope?.total_cost_usd === "number") {
+    meta.costUsd += result.envelope.total_cost_usd;
+  }
+  reporter.line(
+    `advisor finished in ${formatElapsed(result.durationMs)} (exit ${result.status}${result.timedOut ? ", timed out" : ""})`,
+    { force: true }
+  );
+
+  const answer = typeof result.envelope?.result === "string" ? result.envelope.result.trim() : "";
+  if (result.status !== 0 || result.timedOut || !answer) {
+    const detail = result.timedOut
+      ? "advisory run timed out"
+      : result.status !== 0
+        ? shorten(result.stderr || "claude exited non-zero", 600)
+        : "the advisor returned no answer text";
+    return { ok: false, rendered: renderFailure(meta, detail, answer), meta, data: null };
+  }
+
+  reporter.phase("rendering answer");
+  const lines = [
+    "# Fable Advisory",
+    "",
+    `Question: ${request.question}`,
+    "",
+    answer,
+  ];
+  if (meta.sessionIds.length) {
+    lines.push("", `Resume interactively: claude -r ${meta.sessionIds[meta.sessionIds.length - 1]}`);
+  }
+  if (meta.costUsd) lines.push(`Estimated cost: $${meta.costUsd.toFixed(2)}`);
+  return {
+    ok: true,
+    rendered: `${lines.join("\n").trimEnd()}\n`,
+    meta,
+    data: { verdict: null, summary: shorten(answer, 140), answer },
+  };
+}
+
+async function runJob(dir, job, { interactive = false } = {}) {
+  // A background job can be cancelled before its worker boots.
+  if (readJob(dir, job.id)?.status === "cancelled") {
+    appendLog(job.logFile, "job was cancelled before it started — not running");
+    return { ok: false, rendered: `Job ${job.id} was cancelled before it started.\n`, data: null };
+  }
   job.status = "running";
   job.pid = process.pid;
+  job.progress = {
+    phase: "starting",
+    toolCalls: 0,
+    lastActivity: null,
+    lastActivityAt: nowIso(),
+    startedAt: nowIso(),
+  };
   writeJob(dir, job);
+  const reporter = createReporter({ dir, job, interactive });
+  const execute = job.kind === "advisory" ? executeAdvisory : executeReview;
   try {
-    const outcome = await executeReview(job.request, { dir, job, log });
+    const outcome = await execute(job.request, { reporter });
     fs.writeFileSync(job.reportFile, outcome.rendered);
     if (outcome.data) {
       fs.writeFileSync(
@@ -801,50 +1104,60 @@ async function runReviewJob(dir, job) {
     job.costUsd = outcome.meta.costUsd || null;
     job.completedAt = nowIso();
     job.pid = null;
+    job.progress = { ...job.progress, phase: "done" };
+    if (readJob(dir, job.id)?.status === "cancelled") {
+      appendLog(job.logFile, `job finished as ${job.status} but was already cancelled — keeping cancelled state`);
+      return outcome;
+    }
     writeJob(dir, job);
+    reporter.line(`job ${job.id} ${job.status}`, { force: true });
     return outcome;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    log(`error: ${message}`);
-    fs.writeFileSync(job.reportFile, `# Fable Review\n\nReview failed: ${message}\n`);
+    reporter.line(`error: ${message}`, { force: true });
+    fs.writeFileSync(job.reportFile, `# Fable ${job.kind === "advisory" ? "Advisory" : "Review"}\n\nRun failed: ${message}\n`);
     job.status = "failed";
     job.error = message;
     job.completedAt = nowIso();
     job.pid = null;
     writeJob(dir, job);
-    return { ok: false, rendered: `Review failed: ${message}\n` };
+    return { ok: false, rendered: `Run failed: ${message}\n` };
   }
 }
 
 // ---------------------------------------------------------------------------
 // subcommands
 
-function buildReviewRequest(options, positionals) {
-  const effort = (options.effort ?? DEFAULT_EFFORT).toLowerCase();
+function validateEffort(rawEffort) {
+  const effort = (rawEffort ?? DEFAULT_EFFORT).toLowerCase();
   if (!VALID_EFFORTS.has(effort)) {
-    fail(`Unsupported effort "${options.effort}". Use one of: low, medium, high, xhigh, max.`);
+    fail(`Unsupported effort "${rawEffort}". Use one of: low, medium, high, xhigh, max.`);
   }
+  return effort;
+}
+
+function buildReviewRequest(options, positionals) {
   return {
     cwd: options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd(),
     base: options.base ?? null,
     scope: options.scope ?? "auto",
     model: options.model ?? DEFAULT_MODEL,
-    effort,
+    effort: validateEffort(options.effort),
     adversarial: Boolean(options.adversarial),
     deep: Boolean(options.deep),
+    quiet: Boolean(options.quiet),
     focusText: positionals.join(" ").trim(),
   };
 }
 
-function createJob(dir, request, target) {
+function createJob(dir, request, { kind, targetLabel }) {
   const id = newJobId();
-  const kindLabel = request.deep ? "deep-review" : request.adversarial ? "adversarial-review" : "review";
   const job = {
     id,
-    kind: kindLabel,
+    kind,
     status: "queued",
-    title: `Fable ${kindLabel}`,
-    targetLabel: target.label,
+    title: `Fable ${kind}`,
+    targetLabel,
     createdAt: nowIso(),
     completedAt: null,
     pid: null,
@@ -856,10 +1169,35 @@ function createJob(dir, request, target) {
   return job;
 }
 
+// Detaches a worker process for --background jobs and prints polling guidance.
+function launchBackground(dir, repoRoot, job, options) {
+  const scriptPath = fileURLToPath(import.meta.url);
+  const child = spawn(process.execPath, [scriptPath, "worker", "--repo", repoRoot, "--job", job.id], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  job.pid = child.pid ?? null;
+  writeJob(dir, job);
+  const payload = { jobId: job.id, status: "queued", title: job.title, target: job.targetLabel };
+  process.stdout.write(
+    options.json
+      ? `${JSON.stringify(payload, null, 2)}\n`
+      : [
+          `${job.title} started in the background as ${job.id} (${job.targetLabel}).`,
+          `Poll progress (live phase, tool activity, elapsed time): fable-check status ${job.id}  — every 30-60s is a good cadence.`,
+          `Stream the activity log: tail -f ${job.logFile}`,
+          `Get the report when done: fable-check result ${job.id}`,
+          `It is still healthy as long as status shows recent activity; only treat it as stalled if status itself says so.`,
+        ].join("\n") + "\n"
+  );
+}
+
 async function handleReview(argv) {
   const { options, positionals } = parseArgs(argv, {
     valueFlags: ["base", "scope", "model", "effort", "cwd"],
-    boolFlags: ["adversarial", "deep", "background", "json"],
+    boolFlags: ["adversarial", "deep", "background", "json", "quiet"],
   });
   const request = buildReviewRequest(options, positionals);
 
@@ -867,33 +1205,60 @@ async function handleReview(argv) {
   const repoRoot = ensureGitRepository(request.cwd);
   const target = resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
   const dir = jobsDir(repoRoot);
-  const job = createJob(dir, request, target);
+  const kind = request.deep ? "deep-review" : request.adversarial ? "adversarial-review" : "review";
+  const job = createJob(dir, request, { kind, targetLabel: target.label });
 
   if (options.background) {
-    const scriptPath = fileURLToPath(import.meta.url);
-    const child = spawn(process.execPath, [scriptPath, "worker", "--repo", repoRoot, "--job", job.id], {
-      cwd: repoRoot,
-      detached: true,
-      stdio: "ignore",
-    });
-    child.unref();
-    job.pid = child.pid ?? null;
-    writeJob(dir, job);
-    const payload = { jobId: job.id, status: "queued", title: job.title, target: target.label };
-    process.stdout.write(
-      options.json
-        ? `${JSON.stringify(payload, null, 2)}\n`
-        : `${job.title} started in the background as ${job.id} (${target.label}).\nCheck progress: fable-check status ${job.id}\nGet the report: fable-check result ${job.id}\n`
-    );
+    launchBackground(dir, repoRoot, job, options);
     return;
   }
 
-  const outcome = await runReviewJob(dir, job);
+  const outcome = await runJob(dir, job, { interactive: true });
   if (options.json) {
     process.stdout.write(`${JSON.stringify({ job: readJob(dir, job.id), result: outcome.data ?? null }, null, 2)}\n`);
   } else {
     process.stdout.write(outcome.rendered);
     process.stdout.write(`\nReport saved: ${job.reportFile}\n`);
+  }
+  if (!outcome.ok) process.exitCode = 1;
+}
+
+async function handleAsk(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    valueFlags: ["model", "effort", "cwd"],
+    boolFlags: ["background", "json", "quiet"],
+  });
+  const question = positionals.join(" ").trim();
+  if (!question) {
+    fail('ask requires a question, e.g. `fable-check.mjs ask "should the job runner use worker threads?"`');
+  }
+  const request = {
+    cwd: options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd(),
+    model: options.model ?? DEFAULT_MODEL,
+    effort: validateEffort(options.effort),
+    quiet: Boolean(options.quiet),
+    question,
+  };
+
+  ensureClaudeAvailable();
+  const repoRoot = ensureGitRepository(request.cwd);
+  const dir = jobsDir(repoRoot);
+  const job = createJob(dir, request, {
+    kind: "advisory",
+    targetLabel: shorten(question, 80),
+  });
+
+  if (options.background) {
+    launchBackground(dir, repoRoot, job, options);
+    return;
+  }
+
+  const outcome = await runJob(dir, job, { interactive: true });
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({ job: readJob(dir, job.id), result: outcome.data ?? null }, null, 2)}\n`);
+  } else {
+    process.stdout.write(outcome.rendered);
+    process.stdout.write(`\nAnswer saved: ${job.reportFile}\n`);
   }
   if (!outcome.ok) process.exitCode = 1;
 }
@@ -904,13 +1269,33 @@ async function handleWorker(argv) {
   const dir = jobsDir(options.repo);
   const job = readJob(dir, options.job);
   if (!job) fail(`No job ${options.job} found for this repository.`);
-  await runReviewJob(dir, job);
+  await runJob(dir, job);
 }
 
 function describeJob(job) {
-  const lines = [`- ${job.id} | ${effectiveStatus(job)} | ${job.kind} | ${job.targetLabel}`];
+  const status = effectiveStatus(job);
+  const lines = [`- ${job.id} | ${status} | ${job.kind} | ${job.targetLabel}`];
   if (job.summary) lines.push(`  Summary: ${job.summary}`);
   if (job.verdict) lines.push(`  Verdict: ${job.verdict}`);
+  if (status === "running" && job.progress) {
+    const elapsedMs = Date.now() - Date.parse(job.progress.startedAt ?? job.createdAt);
+    lines.push(
+      `  Elapsed: ${formatElapsed(elapsedMs)} | Phase: ${job.progress.phase ?? "unknown"} | Tool calls: ${job.progress.toolCalls ?? 0}`
+    );
+    if (job.progress.lastActivity) {
+      const ageMs = Date.now() - Date.parse(job.progress.lastActivityAt ?? job.createdAt);
+      lines.push(`  Last activity (${formatElapsed(ageMs)} ago): ${job.progress.lastActivity}`);
+      // Stall detection keys off the model's last proof of life (any stream
+      // event, incl. thinking ticks) — wrapper heartbeats don't count.
+      const eventAgeMs =
+        Date.now() - Date.parse(job.progress.lastEventAt ?? job.progress.lastActivityAt ?? job.createdAt);
+      lines.push(
+        eventAgeMs > STALL_WARN_MS
+          ? `  WARNING: no model events for ${formatElapsed(eventAgeMs)} — possibly stalled. Consider \`fable-check cancel ${job.id}\` and rerunning.`
+          : `  Healthy: activity is recent. Long runs are normal — poll again in 30-60s.`
+      );
+    }
+  }
   if (job.status === "completed" || job.status === "failed") {
     lines.push(`  Report: fable-check result ${job.id}`);
   }
@@ -1024,13 +1409,24 @@ function handleCancel(argv) {
       // already gone
     }
   }
-  job.status = "cancelled";
-  job.completedAt = nowIso();
-  job.pid = null;
-  writeJob(dir, job);
-  appendLog(job.logFile, "Cancelled by user.");
+  // The worker may have finished between our read and the kill — don't
+  // overwrite a completed/failed job with a stale cancellation.
+  const current = readJob(dir, job.id) ?? job;
+  if (current.status === "completed" || current.status === "failed") {
+    process.stdout.write(
+      options.json
+        ? `${JSON.stringify(current, null, 2)}\n`
+        : `Job ${current.id} already finished as ${current.status} — nothing to cancel. Report: fable-check result ${current.id}\n`
+    );
+    return;
+  }
+  current.status = "cancelled";
+  current.completedAt = nowIso();
+  current.pid = null;
+  writeJob(dir, current);
+  appendLog(current.logFile, "Cancelled by user.");
   process.stdout.write(
-    options.json ? `${JSON.stringify(job, null, 2)}\n` : `Cancelled ${job.id} (${job.kind}).\n`
+    options.json ? `${JSON.stringify(current, null, 2)}\n` : `Cancelled ${current.id} (${current.kind}).\n`
   );
 }
 
@@ -1100,18 +1496,23 @@ function handleSetup(argv) {
 function printUsage() {
   process.stdout.write(
     [
-      "fable-check — extensive code review powered by Claude Fable 5",
+      "fable-check — extensive code review and advisory powered by Claude Fable 5",
       "",
       "Usage:",
       "  fable-check.mjs setup [--json]",
       "  fable-check.mjs review [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
-      "                         [--effort low|medium|high|xhigh|max] [--model <model>] [--background] [--json] [focus text]",
+      "                         [--effort low|medium|high|xhigh|max] [--model <model>]",
+      "                         [--background] [--json] [--quiet] [focus text]",
+      "  fable-check.mjs ask    [--effort ...] [--model ...] [--background] [--json] [--quiet] <question>",
       "  fable-check.mjs status [job-id] [--json]",
       "  fable-check.mjs result [job-id] [--json]",
       "  fable-check.mjs cancel [job-id] [--json]",
       "",
       "Reviews are read-only. Focus text steers the review (most useful with --adversarial).",
       "--deep runs three parallel lens passes (correctness, security, design) plus a merge pass.",
+      "`ask` answers an advisory question (architecture, tradeoffs, second opinions) with read-only repo access.",
+      "Progress streams to stderr while running (tool calls + heartbeats every ~20s); --quiet suppresses it.",
+      "Background jobs expose live progress via `status` (phase, elapsed, last activity).",
       "",
     ].join("\n")
   );
@@ -1126,6 +1527,9 @@ async function main() {
       break;
     case "review":
       await handleReview(argv);
+      break;
+    case "ask":
+      await handleAsk(argv);
       break;
     case "worker":
       await handleWorker(argv);

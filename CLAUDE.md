@@ -1,12 +1,14 @@
 # fable-check — project context
 
-Cross-agent skill (Claude Code + Codex) that runs extensive code reviews using Claude Fable 5 via the local `claude` CLI in headless mode. Inverse of openai/codex-plugin-cc.
+Cross-agent skill (Claude Code + Codex) that runs extensive code reviews and advisory Q&A using Claude Fable 5 via the local `claude` CLI in headless mode. Inverse of openai/codex-plugin-cc.
 
 ## Architecture
 
 - `skill/` is the portable unit — symlinked into `~/.claude/skills/fable-check` and `~/.codex/skills/fable-check` by `install.sh`. Both agents read the same SKILL.md format.
-- `skill/scripts/fable-check.mjs` — single zero-dependency Node ESM script. Subcommands: `setup`, `review`, `worker` (internal), `status`, `result`, `cancel`.
-- Reviews call `claude -p --model claude-fable-5 --effort xhigh --output-format json --json-schema <schema> --allowedTools <read-only set>` with the prompt on **stdin**. Auth is the user's Claude Code login — never an API key.
+- `skill/scripts/fable-check.mjs` — single zero-dependency Node ESM script. Subcommands: `setup`, `review`, `ask` (advisory), `worker` (internal), `status`, `result`, `cancel`.
+- Runs call `claude -p --model claude-fable-5 --effort xhigh --output-format stream-json --verbose [--json-schema <schema>] --allowedTools <read-only set>` with the prompt on **stdin**. Auth is the user's Claude Code login — never an API key.
+- **stream-json powers live progress**: each `assistant` event's `tool_use` blocks become progress lines; the final `{type:"result"}` event is the envelope (same fields as `--output-format json`: `result`, `structured_output`, `session_id`, `total_cost_usd` — verified empirically 2026-06-11). Progress goes to stderr (foreground), the job log, and a throttled `progress` field in the job JSON that `status` renders (elapsed/phase/tool calls/last activity + stall warning after 5 min idle). Heartbeat every ~20s (override: `FABLE_CHECK_HEARTBEAT_MS`, inherited by background workers).
+- `ask` reuses the same job machinery with `prompts/advise.md`, no schema (prose answer from `envelope.result`), kind `advisory`; `runJob` dispatches executor by `job.kind`.
 - Job state and reports live in `~/.fable-check/jobs/<repo-basename>-<sha1-8>/` — never inside reviewed repos.
 - `--deep` runs the 3 lenses in `LENSES` concurrently, then a merge pass at `high` effort using `prompts/merge.md`.
 

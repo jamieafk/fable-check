@@ -1,16 +1,19 @@
 # fable-check
 
-Extensive code review powered by **Claude Fable 5** — usable as a skill from both **Claude Code** and **Codex**. The inverse of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc): instead of Claude Code calling Codex for reviews, any agent (or your terminal) calls Fable 5 for reviews.
+Extensive code review and advisory powered by **Claude Fable 5** — usable as a skill from both **Claude Code** and **Codex**. The inverse of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc): instead of Claude Code calling Codex for reviews, any agent (or your terminal) calls Fable 5 for reviews.
 
 ## What you get
 
 - `review` — a thorough, structured review of your uncommitted changes or your branch vs a base. Verdict (approve / needs-attention), severity-sorted findings with file:line locations, confidence scores, and next steps.
 - `review --adversarial [focus text]` — a skeptical review that actively tries to block the change. Steerable: "challenge the retry design", "look for race conditions", etc.
 - `review --deep` — three parallel review passes (correctness, security & data safety, design & failure modes) merged and de-duplicated into one report. The most extensive mode.
-- `status` / `result` / `cancel` + `--background` — run long reviews in the background.
+- `ask "<question>"` — advisory mode: Fable explores your repo read-only and answers an architecture/design/tradeoff question in prose, with one clear recommendation.
+- `status` / `result` / `cancel` + `--background` — run long jobs in the background with live progress (phase, elapsed time, tool activity).
 - `setup` — checks that everything is installed and logged in.
 
 The reviewer runs **read-only**: it can read files, grep, and run read-only git commands to verify findings against the real code, but it can never modify anything.
+
+Runs are **never silent**: every tool call the reviewer makes streams to stderr as a progress line, with heartbeats every ~20s during thinking stretches — so a watching agent (or human) always knows it's alive, what phase it's in, and what it's doing.
 
 ## Requirements
 
@@ -36,6 +39,8 @@ node skill/scripts/fable-check.mjs review
 node skill/scripts/fable-check.mjs review --base main
 node skill/scripts/fable-check.mjs review --adversarial question whether this caching design is safe
 node skill/scripts/fable-check.mjs review --deep --background
+node skill/scripts/fable-check.mjs ask "is the detached-worker design for background jobs sound, or should this use a queue?"
+node skill/scripts/fable-check.mjs status   # live progress of a background job
 node skill/scripts/fable-check.mjs result
 ```
 
@@ -44,11 +49,11 @@ node skill/scripts/fable-check.mjs result
 The script collects your git context (working-tree diff or branch diff against a base; auto-detected like the original plugin). Small diffs are inlined into the prompt; large ones switch the reviewer into self-collect mode, where it explores the repo itself with read-only tools. It then runs the local `claude` CLI headlessly:
 
 ```
-claude -p --model claude-fable-5 --effort xhigh --output-format json \
+claude -p --model claude-fable-5 --effort xhigh --output-format stream-json --verbose \
   --json-schema <review schema> --allowedTools <read-only set>
 ```
 
-Structured output is validated against the schema by the CLI itself. Reports are printed, saved under `~/.fable-check/jobs/<repo>/`, and include a `claude -r <session-id>` command to reopen the review session interactively.
+The streamed events power live progress reporting (per-tool-call lines + heartbeats on stderr; live `status` for background jobs); the final event carries the structured review, which is validated against the schema. Reports are printed, saved under `~/.fable-check/jobs/<repo>/`, and include a `claude -r <session-id>` command to reopen the review session interactively.
 
 ## Differences from codex-plugin-cc
 
