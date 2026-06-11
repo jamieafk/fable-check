@@ -2,7 +2,7 @@
 
 ## Product goal
 
-Give any coding agent (Claude Code, Codex) and any terminal a one-command, extensive code review by Claude Fable 5 — the strongest reviewer model available — before work ships. The mirror image of OpenAI's codex-plugin-cc.
+Give any coding agent (Claude Code, Codex) and any terminal a one-command, extensive code review — or advisory answer to an architecture/design question — by Claude Fable 5, the strongest reviewer model available, before work ships. The mirror image of OpenAI's codex-plugin-cc.
 
 ## Target user
 

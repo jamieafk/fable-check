@@ -61,7 +61,7 @@ Runs take minutes, but they are **never silent**. While running, the script stre
 Interpretation rules:
 
 - **Do not kill or abandon a run that is emitting progress lines or heartbeats — it is healthy.** Typical durations: standard review 2–8 min, deep review 5–15 min, advisory 1–6 min (longer for big diffs or `max` effort).
-- Silence for more than ~60 seconds is abnormal; only then check on it. The script itself flags a job as `possibly stalled` in `status` after 5 minutes without activity.
+- Silence for more than ~60 seconds is abnormal; only then check on it. The script itself flags a job as `possibly stalled` in `status` after 5 minutes without any model events (its own heartbeats don't count as activity).
 - If your execution harness has a command timeout shorter than ~15 minutes, run with `--background` instead of stretching the timeout.
 
 ## Foreground vs background

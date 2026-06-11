@@ -14,7 +14,7 @@ Cross-agent skill (Claude Code + Codex) that runs extensive code reviews and adv
 
 ## Decisions
 
-- **CLI flags were verified against the installed `claude` binary** (`--json-schema`, `--effort`, `--allowedTools`, `--output-format json` all exist). If a flag errors after a Claude Code update, re-run `claude --help` before changing code.
+- **CLI flags were verified against the installed `claude` binary** (`--json-schema`, `--effort`, `--allowedTools`, `--output-format stream-json` + `--verbose` all exist). If a flag errors after a Claude Code update, re-run `claude --help` before changing code.
 - Inline-diff threshold is 400KB (Fable has 1M context); above that the reviewer self-collects via read-only git commands. This is deliberately much more generous than the original plugin's 256KB/2-file limit.
 - `rescue` (task delegation) and the Stop-hook review gate from the original plugin were deliberately excluded — out of scope for a review skill; the gate is plugin-only and drains usage.
 - **`--json-schema` is NOT reliably enforced on agentic `-p` runs** (verified empirically on CLI 2.1.170: a simple prompt returns `structured_output`; a tool-using review returned freeform fenced JSON with renamed fields like `status`/`lines`/`fix`). Mitigations, both required: (1) the schema text is appended to every prompt verbatim in `runClaude`; (2) `extractStructured` + `normalizeReviewData` tolerate fenced JSON, synonym field names, and off-enum severities. Don't remove either.
